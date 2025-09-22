@@ -52,7 +52,6 @@ class CrewPlan(BaseModel):
         mapping = {
             "sequential": Process.sequential,
             "hierarchical": Process.hierarchical,
-            "parallel": Process.parallel,
         }
         return mapping.get(self.process.lower(), Process.sequential)
 
@@ -190,7 +189,7 @@ class DynamicCrewOrchestrator:
                 verbose=agent_plan.verbose or self.verbose,
                 tools=tools,
                 llm=self.agent_llm_factory(agent_plan),
-                max_iter=agent_plan.max_iter,
+                max_iter=agent_plan.max_iter if agent_plan.max_iter is not None else 5,
             )
             agent_lookup[agent_plan.name] = agent
 
