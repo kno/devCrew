@@ -22,8 +22,18 @@ based on a single natural language prompt.
    pip install -r requirements.txt
    ```
 
-2. Configure your LLM credentials (for example `OPENAI_API_KEY`) in the
-   environment so that `langchain`/`crewai` can access them.
+2. Create a `.env` file with the credentials for the language models you want to
+   use. For example:
+
+   ```bash
+   echo "MODEL_PROVIDER=ollama" >> .env
+   echo "PLANNER_MODEL=llama3" >> .env
+   echo "AGENT_MODEL=llama3" >> .env
+   ```
+
+   Any variables defined in `.env` are loaded automatically (such as
+   `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_HOST`, etc.) so you can switch
+   between providers without changing the code.
 
 3. Run the orchestrator by passing the problem statement as an argument:
 
@@ -32,7 +42,13 @@ based on a single natural language prompt.
    ```
 
    Use `--show-plan` to inspect the planned crew and tasks before execution or
-   `--dry-run` to only produce the plan without running the crew.
+   `--dry-run` to only produce the plan without running the crew. You can also
+   override providers/models via CLI flags, e.g.
+
+   ```bash
+   python -m devcrew --planner-provider anthropic --planner-model claude-3-haiku \
+     "Summarise the latest quarterly results for stakeholders"
+   ```
 
 ## Extending
 
