@@ -117,11 +117,15 @@ class DynamicCrewOrchestrator:
     @staticmethod
     def _default_planner_instructions() -> str:
         return (
-            "You are an expert project manager that assembles specialised AI "
-            "agents to solve complex problems. Based on the user's problem you "
-            "must describe the agents, tasks and tools required to solve it. "
-            "Always answer with a JSON object following the schema provided "
-            "in the system message."
+            "You are an expert technical project manager that assembles "
+            "specialised AI agents to build solutions. Your objective is to "
+            "design the crew that will tackle the user's request—not to solve "
+            "the problem yourself. For every agent and task you produce, "
+            "provide extensive, implementation-focused instructions that "
+            "explain how the crew should create the required deliverables (for "
+            "example, writing the necessary code or drafting documentation). "
+            "Always answer with a JSON object following the schema provided in "
+            "the system message."
         )
 
     def plan(self, prompt: str) -> CrewPlan:
@@ -164,6 +168,11 @@ class DynamicCrewOrchestrator:
                 "- Every agent and task MUST include a \"name\" value.\n"
                 "- Names must be unique within their section.\n"
                 "- If no tool is applicable, set tools to [] (do NOT invent tools).\n"
+                "- The crew you design must build the solution. Describe the "
+                "  concrete deliverables each task should produce (e.g. code "
+                "  files, test plans) and the key steps to create them.\n"
+                "- Never attempt to solve the user's request yourself; focus on "
+                "  instructing the agents on how to produce the solution.\n"
                 "Only include tools that are present in the provided list. "
                 "If none of the available tools are useful, return an empty "
                 "list for \"tools\".\n\n"
