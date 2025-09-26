@@ -19,7 +19,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
 import yaml
-from crewai import LLM
+from .llm import SafeLLM
 
 from .orchestrator import (
     AgentPlan,
@@ -100,7 +100,7 @@ def build_orchestrator(args: argparse.Namespace) -> DynamicCrewOrchestrator:
     def agent_factory(agent_plan: AgentPlan):
         model_name = args.agent_model or args.planner_model
         model_id = f"{agent_provider}/{model_name}"
-        return LLM(
+        return SafeLLM(
             model=model_id,
             api_key=api_key,
             base_url=base_url,
