@@ -9,7 +9,7 @@ import sys
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
@@ -18,7 +18,12 @@ from langchain_openai import ChatOpenAI
 
 from crewai import LLM
 
-from .orchestrator import AgentPlan, DynamicCrewOrchestrator, PlanGenerationError
+from .orchestrator import (
+    AgentPlan,
+    CrewPlan,
+    DynamicCrewOrchestrator,
+    PlanGenerationError,
+)
 from .tools import build_default_tool_registry
 
 
@@ -142,6 +147,22 @@ def _save_outputs(outdir: Path, plan, result, fmt: str) -> None:
     logging.info("Outputs saved: %s , %s", plan_file, result_file)
 
 
+def _prompt_for_execution(plan: CrewPlan) -> bool:
+    """Ask the user whether the freshly built crew should be executed."""
+
+    prompt = (
+        f"Crew planned with {len(plan.agents)} agents and {len(plan.tasks)} tasks. "
+        "Run it now? [y/N]: "
+    )
+    try:
+        response = input(prompt)
+    except EOFError:
+        logging.info("No input available to confirm execution; skipping run.")
+        return False
+
+    return response.strip().lower() in {"y", "yes"}
+
+
 async def main(argv: Optional[list[str]] = None) -> int:
     load_dotenv()
 
@@ -161,6 +182,11 @@ async def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--agent-temperature", type=float, default=0.3, help="Temperature for execution agents.")
     parser.add_argument("--dry-run", action="store_true", help="Only show the generated plan without executing the crew.")
     parser.add_argument("--show-plan", action="store_true", help="Print the plan in JSON format.")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Automatically run the crew after planning without prompting.",
+    )
     parser.add_argument("--output-dir", default="outputs", help="Directory to save plan and results (default: ./outputs)")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for the final result.")
     parser.add_argument("--stream", action="store_true", help="Stream token-by-token from agent LLMs.")
@@ -193,32 +219,63 @@ async def main(argv: Optional[list[str]] = None) -> int:
             _save_outputs(outdir, plan, {}, "json")
             return 0
 
-        # Ejecuta la crew (el listener imprimirá los tokens si stream=True)
-        run_out = orchestrator.run(prompt)
-        plan = run_out.get("plan")
-        final_result = run_out.get("result")
+        built = orchestrator.plan_and_build(prompt)
+        plan = built.plan
 
         if args.show_plan:
             print("\n=== Plan (JSON) ===\n")
             print(json.dumps(plan.model_dump(), indent=2))
 
-        print("\n=== Crew output ===\n")
-        if args.format == "json":
-            out = {
-                "summary": plan.summary,
-                "process": plan.process,
-                "agents": [a.name for a in plan.agents],
-                "tasks": [t.name for t in plan.tasks],
-                "result": final_result,
-            }
-            print(json.dumps(out, indent=2, ensure_ascii=False))
+        if args.execute:
+            should_run = True
         else:
-            if isinstance(final_result, (dict, list)):
-                print(json.dumps(final_result, indent=2, ensure_ascii=False))
-            else:
-                print(str(final_result))
+            should_run = _prompt_for_execution(plan)
 
-        _save_outputs(outdir, plan, final_result, args.format)
+        executed = False
+        final_result = None
+        saved_result: Any
+
+        if should_run:
+            run_out = orchestrator.kickoff(built, prompt)
+            final_result = run_out.get("result")
+            executed = True
+            saved_result = final_result
+        else:
+            skip_message = "Execution skipped by user request."
+            logging.info(skip_message)
+            saved_result = {"status": "skipped", "message": skip_message}
+
+        if executed:
+            print("\n=== Crew output ===\n")
+            if args.format == "json":
+                out = {
+                    "summary": plan.summary,
+                    "process": plan.process,
+                    "agents": [a.name for a in plan.agents],
+                    "tasks": [t.name for t in plan.tasks],
+                    "result": saved_result,
+                }
+                print(json.dumps(out, indent=2, ensure_ascii=False))
+            else:
+                if isinstance(final_result, (dict, list)):
+                    print(json.dumps(final_result, indent=2, ensure_ascii=False))
+                else:
+                    print(str(final_result))
+        else:
+            print("\nCrew execution skipped.\n")
+            if args.format == "json":
+                out = {
+                    "summary": plan.summary,
+                    "process": plan.process,
+                    "agents": [a.name for a in plan.agents],
+                    "tasks": [t.name for t in plan.tasks],
+                    "result": saved_result,
+                }
+                print(json.dumps(out, indent=2, ensure_ascii=False))
+            else:
+                print(saved_result["message"])
+
+        _save_outputs(outdir, plan, saved_result, args.format)
         return 0
 
     except PlanGenerationError as e:

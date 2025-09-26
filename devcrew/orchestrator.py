@@ -365,11 +365,22 @@ class DynamicCrewOrchestrator:
         )
         return BuiltCrew(plan=plan, crew=crew)
 
-    def run(self, prompt: str, *, kickoff_inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Plan, build and execute a crew to respond to ``prompt``."""
+    def plan_and_build(self, prompt: str) -> BuiltCrew:
+        """Convenience helper that plans and immediately builds a crew."""
 
         plan = self.plan(prompt)
-        built = self.build_crew(plan)
+        return self.build_crew(plan)
+
+    def kickoff(
+        self,
+        built: BuiltCrew,
+        prompt: str,
+        *,
+        kickoff_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Kick off an already planned and built crew."""
+
+        plan = built.plan
         inputs = {"problem": prompt}
         if kickoff_inputs:
             inputs.update(kickoff_inputs)
@@ -402,3 +413,9 @@ class DynamicCrewOrchestrator:
                 )
 
         return {"plan": plan, "result": result}
+
+    def run(self, prompt: str, *, kickoff_inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Plan, build and execute a crew to respond to ``prompt``."""
+
+        built = self.plan_and_build(prompt)
+        return self.kickoff(built, prompt, kickoff_inputs=kickoff_inputs)

@@ -41,7 +41,9 @@ based on a single natural language prompt.
    python -m devcrew "Design a marketing strategy for a new eco-friendly water bottle"
    ```
 
-   Use `--show-plan` to inspect the planned crew and tasks before execution or
+   Once the crew is planned you'll be prompted to confirm whether it should be
+   executed. Use `--execute` to skip the prompt and immediately run the crew,
+   `--show-plan` to inspect the planned crew and tasks before execution or
    `--dry-run` to only produce the plan without running the crew. You can also
    override providers/models via CLI flags, e.g.
 
