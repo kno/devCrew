@@ -1,8 +1,10 @@
 """Dynamic crew orchestrator built on top of crewAI."""
 from __future__ import annotations
 
-import json
+import json, time
 import logging
+import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -13,7 +15,35 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .tools import ToolRegistry
 
+
+
+def step_cb(step_output):
+    with open("steps.ndjson", "a") as f:
+        f.write(json.dumps({
+            "ts": time.time(),
+            "type": "step",
+            "agent": getattr(step_output, "agent", None),
+            "content": str(step_output),
+        }, ensure_ascii=False) + "\n")
+
+def task_cb(task_output):
+    with open("steps.ndjson", "a") as f:
+        f.write(json.dumps({
+            "ts": time.time(),
+            "type": "task_end",
+            "task": getattr(task_output, "description", None),
+            "raw": getattr(task_output, "raw_output", None),
+        }, ensure_ascii=False) + "\n")
+
+# ---------- Logging sane defaults ----------
 logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    # Config por defecto si la app no configuró logging
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="[%(levelname)s] %(name)s: %(message)s",
+    )
 
 
 class AgentPlan(BaseModel):
@@ -98,50 +128,56 @@ class DynamicCrewOrchestrator:
         """Generate a :class:`CrewPlan` for ``prompt`` using the planner LLM."""
 
         logger.debug("Planning dynamic crew for prompt: %s", prompt)
-        messages = [
-            SystemMessage(
-                content=(
-                    "You will receive a problem description from the user. "
-                    "Respond **only** with valid JSON that matches this schema:\n"
-                    "{\n"
-                    "  \"summary\": str,\n"
-                    "  \"process\": str,  // sequential | hierarchical | parallel\n"
-                    "  \"agents\": [\n"
-                    "    {\n"
-                    "      \"name\": str,\n"
-                    "      \"role\": str,\n"
-                    "      \"goal\": str,\n"
-                    "      \"backstory\": str,\n"
-                    "      \"tools\": [str],\n"
-                    "      \"allow_delegation\": bool,\n"
-                    "      \"verbose\": bool,\n"
-                    "      \"max_iter\": int | null\n"
-                    "    }\n"
-                    "  ],\n"
-                    "  \"tasks\": [\n"
-                    "    {\n"
-                    "      \"name\": str,\n"
-                    "      \"description\": str,\n"
-                    "      \"expected_output\": str,\n"
-                    "      \"agent\": str,  // reference to an agent name\n"
-                    "      \"tools\": [str],\n"
-                    "      \"async_execution\": bool\n"
-                    "    }\n"
-                    "  ]\n"
-                    "}\n"
-                    "Only include tools that are present in the provided list. "
-                    "If none of the available tools are useful, return an empty "
-                    "list for \"tools\".\n\n"
-                    f"Available tools: {', '.join(self.tool_registry.available())}\n\n"
-                    f"{self._planner_instructions}"
-                )
-            ),
-            HumanMessage(content=prompt),
-        ]
-        response = self.planner_llm.invoke(messages)
+        sys_msg = SystemMessage(
+            content=(
+                "You will receive a problem description from the user. "
+                "Respond **only** with valid JSON that matches this schema:\n"
+                "{\n"
+                "  \"summary\": str,\n"
+                "  \"process\": str,  // sequential | hierarchical | parallel\n"
+                "  \"agents\": [\n"
+                "    {\n"
+                "      \"role\": str,\n"
+                "      \"goal\": str,\n"
+                "      \"backstory\": str,\n"
+                "      \"tools\": [str],\n"
+                "      \"allow_delegation\": bool,\n"
+                "      \"verbose\": bool,\n"
+                "      \"max_iter\": int | null\n"
+                "    }\n"
+                "  ],\n"
+                "  \"tasks\": [\n"
+                "    {\n"
+                "      \"description\": str,\n"
+                "      \"expected_output\": str,\n"
+                "      \"agent\": str,  // reference to an agent name\n"
+                "      \"tools\": [str],\n"
+                "      \"async_execution\": bool\n"
+                "    }\n"
+                "  ]\n"
+                "}\n"
+                "**Hard requirements**:\n"
+                "- Return AT LEAST ONE agent and AT LEAST ONE task.\n"
+                "- Every task.agent MUST reference an existing agent name.\n"
+                "- If no tool is applicable, set tools to [] (do NOT invent tools).\n"
+                "Only include tools that are present in the provided list. "
+                "If none of the available tools are useful, return an empty "
+                "list for \"tools\".\n\n"
+                f"Available tools: {', '.join(self.tool_registry.available())}\n\n"
+                f"{self._planner_instructions}"
+            )
+        )
+        response = self.planner_llm.invoke([sys_msg, HumanMessage(content=prompt)])
         raw_plan = getattr(response, "content", response)
         try:
-            return self._parse_plan(raw_plan)
+            plan = self._parse_plan(raw_plan)
+            logger.info(
+                "Plan created | process=%s | agents=%d | tasks=%d",
+                plan.process, len(plan.agents), len(plan.tasks)
+            )
+            if plan.summary:
+                logger.info("Plan summary: %s", plan.summary)
+            return plan
         except ValidationError as exc:  # pragma: no cover - defensive
             raise PlanGenerationError(
                 f"Planner produced invalid plan: {exc}\nRaw response: {raw_plan}"
@@ -151,23 +187,116 @@ class DynamicCrewOrchestrator:
                 f"Planner did not return valid JSON. Raw response: {raw_plan}"
             ) from exc
 
+    # -----------------------
+    # Parsing / sanitization
+    # -----------------------
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """Remove <think>…</think>, code fences and stray XML/HTML tags around JSON."""
+        s = str(text)
+
+        # Remove DeepSeek/Reasoning style tags
+        s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL | re.IGNORECASE)
+
+        # Remove generic XML/HTML-ish tags that are not part of JSON
+        s = re.sub(r"</?[A-Za-z][A-Za-z0-9:_\-.]*[^>]*>", "", s)
+
+        # Strip code fences ```...```
+        s = re.sub(r"```(json)?", "", s, flags=re.IGNORECASE)
+
+        # Trim whitespace
+        s = s.strip()
+        return s
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> str:
+        """
+        Return the first balanced top-level JSON object found in text.
+        Ignores braces inside string literals and handles escapes.
+        Raises JSONDecodeError if none found.
+        """
+        s = text
+        depth = 0
+        in_str = False
+        escape = False
+        start_idx = -1
+
+        for i, ch in enumerate(s):
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+
+            if ch == "{":
+                if depth == 0:
+                    start_idx = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start_idx != -1:
+                        candidate = s[start_idx : i + 1]
+                        try:
+                            json.loads(candidate)
+                            return candidate
+                        except json.JSONDecodeError:
+                            pass
+
+        raise json.JSONDecodeError("No valid JSON object found", s, 0)
+
     def _parse_plan(self, raw_plan: Any) -> CrewPlan:
         if isinstance(raw_plan, CrewPlan):
             return raw_plan
         if isinstance(raw_plan, dict):
             data = raw_plan
         else:
-            text = str(raw_plan).strip()
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1:
-                raise json.JSONDecodeError("Missing JSON object", text, 0)
-            data = json.loads(text[start : end + 1])
+            text = self._clean_text(str(raw_plan))
+            # Try direct parse first
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                # Extract the first valid object inside the text (handles "Extra data")
+                json_str = self._extract_first_json_object(text)
+                data = json.loads(json_str)
+
         plan = CrewPlan.model_validate(data)
         return plan
 
+    # -----------------------
+    # Fallbacks / build crew
+    # -----------------------
+    def _fallback_agent_plan(self, plan: CrewPlan) -> AgentPlan:
+        """Crea un AgentPlan de respaldo cuando el planner no devuelve agentes."""
+        summary = getattr(plan, "summary", "") or "Solve the user's problem"
+        return AgentPlan(
+            name="Generalist",
+            role="Generalist Agent",
+            goal=f"Analyze the problem and execute tasks to resolve it. Summary: {summary}",
+            backstory="Fallback agent injected because planner returned no agents.",
+            tools=[],
+            allow_delegation=False,
+            verbose=self.verbose,
+            max_iter=5,
+        )
+
     def build_crew(self, plan: CrewPlan) -> BuiltCrew:
         """Instantiate crewAI objects based on ``plan``."""
+
+        # Validaciones previas
+        if not plan.tasks:
+            raise PlanGenerationError("Planner returned no tasks; cannot build a crew.")
+
+        if not plan.agents:
+            logger.warning("Planner returned no agents; injecting fallback 'Generalist'.")
+            plan.agents = [self._fallback_agent_plan(plan)]
 
         agent_lookup: Dict[str, Agent] = {}
         for agent_plan in plan.agents:
@@ -191,16 +320,25 @@ class DynamicCrewOrchestrator:
                 llm=self.agent_llm_factory(agent_plan),
                 max_iter=agent_plan.max_iter if agent_plan.max_iter is not None else 5,
             )
+            try:
+                # si es crewai.LLM
+                llm_model = getattr(agent.llm, "model", None)
+                logger.info("Agent '%s' using LLM model: %s", agent_plan.name, llm_model)
+            except Exception:
+                pass
+
             agent_lookup[agent_plan.name] = agent
 
         tasks: List[Task] = []
+        first_agent = next(iter(agent_lookup.values()))
         for task_plan in plan.tasks:
-            try:
-                assigned_agent = agent_lookup[task_plan.agent]
-            except KeyError as exc:
-                raise PlanGenerationError(
-                    f"Task '{task_plan.name}' references unknown agent '{task_plan.agent}'."
-                ) from exc
+            assigned_agent = agent_lookup.get(task_plan.agent)
+            if assigned_agent is None:
+                logger.warning(
+                    "Task '%s' references unknown agent '%s'. Reassigning to '%s'.",
+                    task_plan.name, task_plan.agent, first_agent.name
+                )
+                assigned_agent = first_agent
             task_tools = [
                 self.tool_registry.get(tool_name)
                 for tool_name in task_plan.tools
@@ -221,24 +359,46 @@ class DynamicCrewOrchestrator:
             tasks=tasks,
             process=plan.process_enum(),
             verbose=self.verbose,
+            output_log_file="run.json",
+            step_callback=step_cb,
+            task_callback=task_cb,
         )
         return BuiltCrew(plan=plan, crew=crew)
 
     def run(self, prompt: str, *, kickoff_inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Plan, build and execute a crew to respond to ``prompt``.
-
-        Returns
-        -------
-        dict
-            A dictionary with the planning information and execution result. The
-            ``plan`` key contains the structured :class:`CrewPlan` and the
-            ``result`` key holds the raw crew output.
-        """
+        """Plan, build and execute a crew to respond to ``prompt``."""
 
         plan = self.plan(prompt)
         built = self.build_crew(plan)
         inputs = {"problem": prompt}
         if kickoff_inputs:
             inputs.update(kickoff_inputs)
+
         result = built.crew.kickoff(inputs=inputs)
+
+        # ---------- Resultado robusto ----------
+        # Algunas versiones de crewAI devuelven objetos o None. Intentamos ofrecer
+        # siempre algo imprimible y útil.
+        def _task_output_to_str(t: Task) -> Optional[str]:
+            for attr in ("output", "result", "output_str"):
+                val = getattr(t, attr, None)
+                if val:
+                    return str(val)
+            return None
+
+        if not result or (isinstance(result, str) and not result.strip()):
+            collected: List[str] = []
+            for t in built.crew.tasks:
+                out = _task_output_to_str(t)
+                if out:
+                    collected.append(f"[{t.name}] {out}")
+            if collected:
+                result = "\n\n".join(collected)
+            else:
+                # Último recurso: un resumen estructurado del plan
+                result = (
+                    "No textual result from crew.kickoff().\n"
+                    f"Plan: process={plan.process}, agents={len(plan.agents)}, tasks={len(plan.tasks)}"
+                )
+
         return {"plan": plan, "result": result}

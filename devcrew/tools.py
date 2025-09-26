@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional
 
 from crewai.tools import BaseTool
+import os
+import requests
 
 
 class ToolRegistry:
@@ -81,8 +83,35 @@ class CalculatorTool(BaseTool):
     async def _arun(self, query: str) -> str:  # pragma: no cover - async path
         return self._run(query)
 
+class SearxngSearchTool(BaseTool):
+  """Busca en SearXNG por query y devuelve un resumen."""
+
+  name: str = "searxng_search"
+  description: str = "Busca en SearXNG por query y devuelve un resumen."
+
+  def _run(self, query: str) -> str:
+    url = os.getenv("SEARX_URL", "http://localhost:8081")
+    try:
+      r = requests.get(
+        f"{url}/search",
+        params={"q": query, "format": "json"},
+        timeout=20
+      )
+      r.raise_for_status()
+      data = r.json()
+      results = [
+        f"- {it.get('title','')} | {it.get('url','')} | {it.get('content','')}"
+        for it in data.get("results", [])[:10]
+      ]
+      return "\n".join(results) or "Sin resultados"
+    except Exception as exc:
+      return f"Error en la búsqueda: {exc}"
+
+  async def _arun(self, query: str) -> str:
+    return self._run(query)
+
 
 def build_default_tool_registry() -> ToolRegistry:
     """Create a :class:`ToolRegistry` pre-populated with common tools."""
 
-    return ToolRegistry(tools=[CalculatorTool()])
+    return ToolRegistry(tools=[CalculatorTool(), SearxngSearchTool()])
