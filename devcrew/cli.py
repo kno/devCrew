@@ -21,6 +21,36 @@ from langchain_openai import ChatOpenAI
 import yaml
 from .llm import SafeLLM
 
+try:  # Optional streaming dependencies (not present in all crewAI installs)
+    from crewai.events.base_event_listener import BaseEventListener
+except Exception:  # pragma: no cover - defensive import shim
+    try:
+        from crewai.utilities.events.base_event_listener import BaseEventListener  # type: ignore
+    except Exception:  # pragma: no cover - best-effort fallback
+        BaseEventListener = object  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional import path variations
+    from crewai.events.event_bus import crewai_event_bus as _get_bus
+except Exception:  # pragma: no cover - fallback when event bus is unavailable
+    _get_bus = None
+
+TokenStreamListener = None
+_token_listener_module = None
+for _candidate in (
+    "crewai.listeners.token_stream_listener",
+    "crewai.events.listeners.streaming.token_stream_listener",
+):
+    if TokenStreamListener is not None:
+        break
+    try:  # pragma: no cover - optional dependency discovery
+        _token_listener_module = __import__(_candidate, fromlist=["TokenStreamListener"])
+        TokenStreamListener = getattr(_token_listener_module, "TokenStreamListener", None)
+    except Exception:
+        TokenStreamListener = None
+
+del _candidate
+del _token_listener_module
+
 from .orchestrator import (
     AgentPlan,
     CrewPlan,
@@ -599,6 +629,23 @@ def _persist_plan_result(
     return result_file
 
 
+def _dump_plan_on_failure(plan: CrewPlan, plan_dir: Optional[Path]) -> None:
+    """Log the current plan to help diagnose failures."""
+
+    try:
+        plan_yaml = _plan_to_yaml_text(plan).strip()
+    except Exception as exc:  # pragma: no cover - defensive serialisation guard
+        logging.debug("Failed to serialise plan for failure dump: %s", exc)
+        return
+
+    if not plan_yaml:
+        return
+
+    logging.error("Plan snapshot at failure:\n%s", plan_yaml)
+    if plan_dir:
+        logging.error("Plan files available under: %s", plan_dir)
+
+
 def _prompt_for_execution(plan: CrewPlan) -> bool:
     """Ask the user whether the freshly built crew should be executed."""
 
@@ -656,15 +703,20 @@ async def main(argv: Optional[list[str]] = None) -> int:
     try:
         # Registrar listener de streaming si procede
         if args.stream and BaseEventListener is not object:
-            listener = TokenStreamListener()
-            if _get_bus:
-                bus = _get_bus()
-                # Algunas versiones requieren .add_listener, otras instanciar el listener basta
-                try:
-                    bus.add_listener(listener)  # type: ignore[attr-defined]
-                except Exception:
-                    # Si el bus inyecta listeners automáticamente vía entrypoints, ignoramos
-                    pass
+            if TokenStreamListener is None:
+                logging.warning(
+                    "Streaming requested but TokenStreamListener is unavailable; skipping listener registration."
+                )
+            else:
+                listener = TokenStreamListener()
+                if callable(_get_bus):
+                    bus = _get_bus()
+                    # Algunas versiones requieren .add_listener, otras instanciar el listener basta
+                    try:
+                        bus.add_listener(listener)  # type: ignore[attr-defined]
+                    except Exception:
+                        # Si el bus inyecta listeners automáticamente vía entrypoints, ignoramos
+                        pass
 
         orchestrator = build_orchestrator(args)
         outdir = _prepare_output_dir(args.output_dir)
@@ -706,10 +758,9 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 result_persisted = True
                 return 0
 
-            built = orchestrator.plan_and_build(prompt)
-            plan = built.plan
-
+            plan = orchestrator.plan(prompt)
             plan_dir = _initialise_plan_storage(outdir, plan, prompt)
+            built = orchestrator.build_crew(plan)
 
             if args.execute:
                 should_run = True
@@ -790,6 +841,9 @@ async def main(argv: Optional[list[str]] = None) -> int:
         logging.warning("Interrupted by user.")
         return 130
     except Exception as e:
+        if plan is not None:
+            _dump_plan_on_failure(plan, plan_dir)
+
         if plan_dir and plan is not None and not result_persisted:
             now_iso = datetime.now().isoformat(timespec="seconds")
             _update_plan_metadata(

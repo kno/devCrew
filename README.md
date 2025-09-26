@@ -74,7 +74,9 @@ based on a single natural language prompt.
    As soon as a run finishes (or is skipped) the corresponding directory is
    updated with the execution status (`planned`, `executed`, `skipped`,
    `dry-run`, `cancelled`, or `error`) and a `result.json`/`result.txt` file so
-   every piece of data is captured the moment it becomes available.
+   every piece of data is captured the moment it becomes available. If a run
+   fails unexpectedly the CLI now dumps the YAML plan to the error log (and
+   points to the saved bundle) to simplify post-mortem analysis.
 
 ## Extending
 
