@@ -137,6 +137,7 @@ class DynamicCrewOrchestrator:
                 "  \"process\": str,  // sequential | hierarchical | parallel\n"
                 "  \"agents\": [\n"
                 "    {\n"
+                "      \"name\": str,\n"
                 "      \"role\": str,\n"
                 "      \"goal\": str,\n"
                 "      \"backstory\": str,\n"
@@ -148,6 +149,7 @@ class DynamicCrewOrchestrator:
                 "  ],\n"
                 "  \"tasks\": [\n"
                 "    {\n"
+                "      \"name\": str,\n"
                 "      \"description\": str,\n"
                 "      \"expected_output\": str,\n"
                 "      \"agent\": str,  // reference to an agent name\n"
@@ -159,6 +161,8 @@ class DynamicCrewOrchestrator:
                 "**Hard requirements**:\n"
                 "- Return AT LEAST ONE agent and AT LEAST ONE task.\n"
                 "- Every task.agent MUST reference an existing agent name.\n"
+                "- Every agent and task MUST include a \"name\" value.\n"
+                "- Names must be unique within their section.\n"
                 "- If no tool is applicable, set tools to [] (do NOT invent tools).\n"
                 "Only include tools that are present in the provided list. "
                 "If none of the available tools are useful, return an empty "
@@ -252,6 +256,107 @@ class DynamicCrewOrchestrator:
 
         raise json.JSONDecodeError("No valid JSON object found", s, 0)
 
+    @staticmethod
+    def _coerce_name(value: str) -> str:
+        if not isinstance(value, str):
+            value = str(value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _ensure_unique_name(base: str, *, used: set[str]) -> str:
+        name = DynamicCrewOrchestrator._coerce_name(base) or "Unnamed"
+        candidate = name
+        suffix = 2
+        while candidate in used:
+            candidate = f"{name} ({suffix})"
+            suffix += 1
+        used.add(candidate)
+        return candidate
+
+    def _normalise_plan_payload(self, data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return data
+
+        normalised: dict[str, Any] = dict(data)
+
+        agents_raw = data.get("agents") or []
+        agents: List[dict[str, Any]] = []
+        used_agent_names: set[str] = set()
+        agent_names: List[str] = []
+        alias_map: dict[str, str] = {}
+
+        for idx, raw in enumerate(list(agents_raw)):
+            if isinstance(raw, dict):
+                agent_dict = dict(raw)
+            elif isinstance(raw, str):
+                agent_dict = {"role": raw}
+            else:
+                continue
+
+            candidates = [
+                self._coerce_name(agent_dict.get("name", "")),
+                self._coerce_name(agent_dict.get("role", "")),
+                f"Agent {idx + 1}",
+            ]
+            base_name = next((c for c in candidates if c), "Agent")
+            name = self._ensure_unique_name(base_name, used=used_agent_names)
+            agent_dict["name"] = name
+
+            if not agent_dict.get("role"):
+                agent_dict["role"] = name
+
+            for label in {agent_dict.get("name"), agent_dict.get("role"), candidates[0]}:
+                coerced = self._coerce_name(label) if label else ""
+                if coerced:
+                    alias_map.setdefault(coerced.lower(), name)
+
+            agents.append(agent_dict)
+            agent_names.append(name)
+
+        if agents:
+            normalised["agents"] = agents
+
+        tasks_raw = data.get("tasks") or []
+        tasks: List[dict[str, Any]] = []
+        used_task_names: set[str] = set()
+
+        for idx, raw in enumerate(list(tasks_raw)):
+            if isinstance(raw, dict):
+                task_dict = dict(raw)
+            elif isinstance(raw, str):
+                task_dict = {"description": raw}
+            else:
+                continue
+
+            candidates = [
+                self._coerce_name(task_dict.get("name", "")),
+                self._coerce_name(task_dict.get("description", "")),
+                f"Task {idx + 1}",
+            ]
+            base_name = next((c for c in candidates if c), "Task")
+            name = self._ensure_unique_name(base_name, used=used_task_names)
+            task_dict["name"] = name
+
+            agent_ref = self._coerce_name(task_dict.get("agent", ""))
+            if agent_ref:
+                mapped = alias_map.get(agent_ref.lower())
+                if not mapped:
+                    mapped = next(
+                        (a for a in agent_names if a.lower() == agent_ref.lower()),
+                        None,
+                    )
+                if mapped:
+                    task_dict["agent"] = mapped
+            if not task_dict.get("agent") and agent_names:
+                task_dict["agent"] = agent_names[0]
+
+            tasks.append(task_dict)
+
+        if tasks:
+            normalised["tasks"] = tasks
+
+        return normalised
+
     def _parse_plan(self, raw_plan: Any) -> CrewPlan:
         if isinstance(raw_plan, CrewPlan):
             return raw_plan
@@ -267,7 +372,8 @@ class DynamicCrewOrchestrator:
                 json_str = self._extract_first_json_object(text)
                 data = json.loads(json_str)
 
-        plan = CrewPlan.model_validate(data)
+        normalised = self._normalise_plan_payload(data)
+        plan = CrewPlan.model_validate(normalised)
         return plan
 
     # -----------------------
