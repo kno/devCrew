@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -23,6 +24,7 @@ from .orchestrator import (
     CrewPlan,
     DynamicCrewOrchestrator,
     PlanGenerationError,
+    BuiltCrew,
 )
 from .tools import build_default_tool_registry
 
@@ -119,13 +121,230 @@ def _prepare_output_dir(path: str) -> Path:
     return outdir
 
 
-def _save_outputs(outdir: Path, plan, result, fmt: str) -> None:
+@dataclass
+class SavedPlanRecord:
+    path: Path
+    plan: CrewPlan
+    prompt: Optional[str]
+    created_at: datetime
+
+
+def _format_plan_label(record: SavedPlanRecord) -> str:
+    timestamp = record.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    summary = record.plan.summary or "(no summary)"
+    return f"{timestamp} · {record.path.name} · {summary}"
+
+
+def _discover_saved_plans(outdir: Path) -> list[SavedPlanRecord]:
+    plans: list[SavedPlanRecord] = []
+    for plan_path in sorted(outdir.glob("plan_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with plan_path.open("r", encoding="utf-8") as fh:
+                raw_data = json.load(fh)
+        except Exception as exc:  # pragma: no cover - defensive IO handling
+            logging.warning("Could not read saved plan %s: %s", plan_path, exc)
+            continue
+
+        plan_data: Optional[dict[str, Any]] = None
+        prompt: Optional[str] = None
+
+        if isinstance(raw_data, dict):
+            if "plan" in raw_data and isinstance(raw_data["plan"], dict):
+                plan_data = raw_data["plan"]
+                prompt = raw_data.get("prompt") or raw_data.get("_prompt")
+            else:
+                prompt = raw_data.get("_prompt")
+                if "_prompt" in raw_data:
+                    # Avoid mutating the cached dict by creating a copy without metadata
+                    plan_data = {k: v for k, v in raw_data.items() if k != "_prompt"}
+                else:
+                    plan_data = raw_data
+
+        if not plan_data:
+            logging.warning("Ignoring malformed plan file: %s", plan_path)
+            continue
+
+        try:
+            plan = CrewPlan.model_validate(plan_data)
+        except Exception as exc:  # pragma: no cover - validation is already tested elsewhere
+            logging.warning("Failed to parse plan %s: %s", plan_path, exc)
+            continue
+
+        created_at = datetime.fromtimestamp(plan_path.stat().st_mtime)
+        plans.append(SavedPlanRecord(path=plan_path, plan=plan, prompt=prompt, created_at=created_at))
+
+    return plans
+
+
+def _select_plan_with_curses(
+    plans: list[SavedPlanRecord],
+) -> tuple[Optional[SavedPlanRecord], bool]:
+    try:
+        import curses
+    except Exception:  # pragma: no cover - curses missing on some platforms
+        return None, False
+
+    if not plans:
+        return None, False
+
+    selected: dict[str, int] = {"index": 0}
+
+    def _menu(stdscr):
+        curses.curs_set(0)
+        idx = selected["index"]
+        offset = 0
+
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            instructions = "Use ↑/↓ to select a plan. Enter executes, q cancels."
+            stdscr.addnstr(0, 0, instructions, max(0, width - 1))
+
+            visible_rows = max(1, height - 2)
+            if idx < offset:
+                offset = idx
+            elif idx >= offset + visible_rows:
+                offset = idx - visible_rows + 1
+
+            for row in range(visible_rows):
+                plan_idx = offset + row
+                if plan_idx >= len(plans):
+                    break
+                record = plans[plan_idx]
+                label = _format_plan_label(record)
+                prefix = "➤ " if plan_idx == idx else "  "
+                text = (prefix + label)[: max(0, width - 1)]
+                if plan_idx == idx:
+                    stdscr.attron(curses.A_REVERSE)
+                    stdscr.addnstr(row + 1, 0, text, max(0, width - 1))
+                    stdscr.attroff(curses.A_REVERSE)
+                else:
+                    stdscr.addnstr(row + 1, 0, text, max(0, width - 1))
+
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                idx = (idx - 1) % len(plans)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                idx = (idx + 1) % len(plans)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                selected["index"] = idx
+                return
+            elif key in (27, ord("q")):
+                raise KeyboardInterrupt
+
+    try:
+        import curses
+
+        curses.wrapper(_menu)
+    except KeyboardInterrupt:
+        return None, True
+    except curses.error:  # pragma: no cover - terminal limitations
+        return None, False
+
+    return plans[selected.get("index", 0)], False
+
+
+def _select_plan_via_input(
+    plans: list[SavedPlanRecord],
+) -> tuple[Optional[SavedPlanRecord], bool]:
+    if not plans:
+        return None, False
+
+    print("\nSaved plans available:")
+    for idx, record in enumerate(plans, start=1):
+        label = _format_plan_label(record)
+        print(f" {idx}. {label}")
+
+    while True:
+        try:
+            response = input("Select a plan number to execute (empty to cancel): ")
+        except EOFError:
+            return None, True
+
+        if not response.strip():
+            return None, True
+
+        if response.strip().lower() in {"q", "quit", "exit"}:
+            return None, True
+
+        try:
+            index = int(response.strip()) - 1
+        except ValueError:
+            print("Invalid selection. Please enter a number from the list.")
+            continue
+
+        if 0 <= index < len(plans):
+            return plans[index], False
+
+        print("Selection out of range. Try again.")
+
+
+def _select_saved_plan(outdir: Path) -> tuple[Optional[SavedPlanRecord], bool]:
+    plans = _discover_saved_plans(outdir)
+    if not plans:
+        logging.error("No saved plans were found in %s", outdir)
+        return None, False
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        selection, cancelled = _select_plan_with_curses(plans)
+        if selection:
+            return selection, False
+        if cancelled:
+            logging.info("Plan selection cancelled by user.")
+            return None, True
+
+    if not sys.stdin.isatty():
+        logging.error("Interactive selection requires a TTY. Cannot continue.")
+        return None, False
+
+    selection, cancelled = _select_plan_via_input(plans)
+    if selection:
+        return selection, False
+    if cancelled:
+        logging.info("Plan selection cancelled by user.")
+        return None, True
+
+    return None, False
+
+
+def _ensure_prompt_for_plan(record: SavedPlanRecord) -> Optional[str]:
+    if record.prompt:
+        return record.prompt
+
+    if not sys.stdin.isatty():
+        logging.error(
+            "The selected plan (%s) does not include the original prompt and no TTY is available to ask for it.",
+            record.path,
+        )
+        return None
+
+    try:
+        response = input(
+            f"Enter the original prompt for {record.path.name} (required to execute the crew): "
+        )
+    except EOFError:
+        logging.error("Prompt capture interrupted. Aborting execution.")
+        return None
+
+    prompt = response.strip()
+    if not prompt:
+        logging.error("A prompt is required to run the selected crew.")
+        return None
+
+    return prompt
+
+
+def _save_outputs(outdir: Path, plan: CrewPlan, result, fmt: str, prompt: Optional[str]) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     plan_file = outdir / f"plan_{timestamp}.json"
     result_file = outdir / f"result_{timestamp}.{ 'json' if fmt=='json' else 'txt'}"
 
+    plan_payload = plan.model_dump()
+    if prompt:
+        plan_payload.setdefault("_prompt", prompt)
+
     with plan_file.open("w", encoding="utf-8") as fh:
-        json.dump(plan.model_dump(), fh, indent=2, ensure_ascii=False)
+        json.dump(plan_payload, fh, indent=2, ensure_ascii=False)
 
     if fmt == "json":
         out = {
@@ -209,27 +428,53 @@ async def main(argv: Optional[list[str]] = None) -> int:
                     pass
 
         orchestrator = build_orchestrator(args)
-        prompt = _load_prompt(args)
         outdir = _prepare_output_dir(args.output_dir)
 
-        if args.dry_run:
-            plan = orchestrator.plan(prompt)
-            if args.show_plan:
-                print(json.dumps(plan.model_dump(), indent=2))
-            _save_outputs(outdir, plan, {}, "json")
-            return 0
+        run_existing_plan = args.execute and not args.prompt and not args.prompt_file
 
-        built = orchestrator.plan_and_build(prompt)
-        plan = built.plan
+        prompt: Optional[str] = None
+        plan: Optional[CrewPlan] = None
+        built: Optional[BuiltCrew] = None
+
+        if run_existing_plan:
+            if args.dry_run:
+                logging.error("--dry-run cannot be combined with executing a saved plan.")
+                return 2
+
+            selection, cancelled = _select_saved_plan(outdir)
+            if not selection:
+                return 0 if cancelled else 1
+
+            plan = selection.plan
+            prompt = _ensure_prompt_for_plan(selection)
+            if not prompt:
+                return 1
+
+            built = orchestrator.build_crew(plan)
+            should_run = True
+        else:
+            prompt = _load_prompt(args)
+
+            if args.dry_run:
+                plan = orchestrator.plan(prompt)
+                if args.show_plan:
+                    print(json.dumps(plan.model_dump(), indent=2))
+                _save_outputs(outdir, plan, {}, "json", prompt)
+                return 0
+
+            built = orchestrator.plan_and_build(prompt)
+            plan = built.plan
+
+            if args.execute:
+                should_run = True
+            else:
+                should_run = _prompt_for_execution(plan)
+
+        assert plan is not None and built is not None and prompt is not None
 
         if args.show_plan:
             print("\n=== Plan (JSON) ===\n")
             print(json.dumps(plan.model_dump(), indent=2))
-
-        if args.execute:
-            should_run = True
-        else:
-            should_run = _prompt_for_execution(plan)
 
         executed = False
         final_result = None
@@ -275,7 +520,7 @@ async def main(argv: Optional[list[str]] = None) -> int:
             else:
                 print(saved_result["message"])
 
-        _save_outputs(outdir, plan, saved_result, args.format)
+        _save_outputs(outdir, plan, saved_result, args.format, prompt)
         return 0
 
     except PlanGenerationError as e:

@@ -52,6 +52,12 @@ based on a single natural language prompt.
      "Summarise the latest quarterly results for stakeholders"
    ```
 
+   If you already have plans stored in the `outputs/` directory you can re-run
+   any of them without providing a new prompt. Launch the CLI with
+   `python -m devcrew --execute` and you'll be presented with an interactive
+   list of saved plans. Use the arrow keys (or number selection fallback) to
+   choose the plan you want to execute.
+
 ## Extending
 
 To add new tools register them in the `ToolRegistry` within `devcrew/tools.py`
