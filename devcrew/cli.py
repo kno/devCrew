@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
@@ -153,6 +154,27 @@ def _plan_to_yaml_text(plan: CrewPlan) -> str:
     )
 
 
+def _update_plan_metadata(plan_dir: Path, **updates: Any) -> None:
+    metadata_path = plan_dir / "metadata.yaml"
+    try:
+        existing = (
+            _yaml_load(metadata_path)
+            if metadata_path.exists()
+            else {}
+        )
+        metadata = existing if isinstance(existing, dict) else {}
+    except Exception:  # pragma: no cover - defensive IO handling
+        metadata = {}
+
+    clean_updates = {k: v for k, v in updates.items() if v is not None}
+    if not clean_updates and metadata_path.exists():
+        # Ensure the file exists even when there is nothing to update.
+        return
+
+    metadata.update(clean_updates)
+    _yaml_dump(metadata_path, metadata)
+
+
 def _write_plan_bundle(plan_dir: Path, plan: CrewPlan, prompt: Optional[str]) -> None:
     bundle = _plan_to_yaml_payload(plan)
     plan_dir.mkdir(parents=True, exist_ok=True)
@@ -162,12 +184,11 @@ def _write_plan_bundle(plan_dir: Path, plan: CrewPlan, prompt: Optional[str]) ->
     _yaml_dump(plan_dir / "tasks.yaml", {"tasks": bundle["tasks"]})
     _yaml_dump(plan_dir / "crew.yaml", bundle["crew"])
 
-    metadata: dict[str, Any] = {
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    if prompt:
-        metadata["prompt"] = prompt
-    _yaml_dump(plan_dir / "metadata.yaml", metadata)
+    _update_plan_metadata(
+        plan_dir,
+        saved_at=datetime.now().isoformat(timespec="seconds"),
+        prompt=prompt,
+    )
 
 
 def _extract_section(data: Any, key: str) -> list[dict[str, Any]]:
@@ -489,16 +510,11 @@ def _persist_prompt_for_plan(record: SavedPlanRecord, prompt: str) -> None:
     timestamp = datetime.now().isoformat(timespec="seconds")
 
     if record.storage_format == "yaml" and record.path.is_dir():
-        metadata_path = record.path / "metadata.yaml"
-        metadata: dict[str, Any]
-        try:
-            existing = _yaml_load(metadata_path) if metadata_path.exists() else {}
-            metadata = existing if isinstance(existing, dict) else {}
-        except Exception:
-            metadata = {}
-
-        metadata.update({"prompt": prompt, "updated_at": timestamp})
-        _yaml_dump(metadata_path, metadata)
+        _update_plan_metadata(
+            record.path,
+            prompt=prompt,
+            updated_at=timestamp,
+        )
         return
 
     if record.path.is_file() and record.path.suffix == ".json":
@@ -513,10 +529,41 @@ def _persist_prompt_for_plan(record: SavedPlanRecord, prompt: str) -> None:
             logging.warning("Failed to persist prompt for %s: %s", record.path, exc)
 
 
-def _save_outputs(outdir: Path, plan: CrewPlan, result, fmt: str, prompt: Optional[str]) -> None:
+def _initialise_plan_storage(
+    outdir: Path,
+    plan: CrewPlan,
+    prompt: Optional[str],
+    *,
+    source: Optional[Path] = None,
+) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plan_dir = outdir / f"plan_{timestamp}"
+    suffix = uuid4().hex[:6]
+    plan_dir = outdir / f"plan_{timestamp}_{suffix}"
+
     _write_plan_bundle(plan_dir, plan, prompt)
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    _update_plan_metadata(
+        plan_dir,
+        status="planned",
+        executed=False,
+        plan_id=plan_dir.name,
+        source=str(source) if source else None,
+        initialised_at=now_iso,
+        updated_at=now_iso,
+    )
+    logging.info("Plan saved in %s", plan_dir)
+    return plan_dir
+
+
+def _persist_plan_result(
+    plan_dir: Path,
+    plan: CrewPlan,
+    result: Any,
+    fmt: str,
+    status: str,
+) -> Path:
+    plan_dir.mkdir(parents=True, exist_ok=True)
 
     if fmt == "json":
         result_file = plan_dir / "result.json"
@@ -537,7 +584,19 @@ def _save_outputs(outdir: Path, plan: CrewPlan, result, fmt: str, prompt: Option
             else:
                 fh.write(str(result))
 
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    executed = status == "executed"
+    _update_plan_metadata(
+        plan_dir,
+        status=status,
+        executed=executed,
+        result_file=result_file.name,
+        result_format=fmt,
+        completed_at=now_iso,
+        updated_at=now_iso,
+    )
     logging.info("Outputs saved in %s (result: %s)", plan_dir, result_file)
+    return result_file
 
 
 def _prompt_for_execution(plan: CrewPlan) -> bool:
@@ -588,6 +647,12 @@ async def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
 
+    prompt: Optional[str] = None
+    plan: Optional[CrewPlan] = None
+    built: Optional[BuiltCrew] = None
+    plan_dir: Optional[Path] = None
+    result_persisted = False
+
     try:
         # Registrar listener de streaming si procede
         if args.stream and BaseEventListener is not object:
@@ -606,10 +671,6 @@ async def main(argv: Optional[list[str]] = None) -> int:
 
         run_existing_plan = args.execute and not args.prompt and not args.prompt_file
 
-        prompt: Optional[str] = None
-        plan: Optional[CrewPlan] = None
-        built: Optional[BuiltCrew] = None
-
         if run_existing_plan:
             if args.dry_run:
                 logging.error("--dry-run cannot be combined with executing a saved plan.")
@@ -624,6 +685,13 @@ async def main(argv: Optional[list[str]] = None) -> int:
             if not prompt:
                 return 1
 
+            plan_dir = _initialise_plan_storage(
+                outdir,
+                plan,
+                prompt,
+                source=selection.path,
+            )
+
             built = orchestrator.build_crew(plan)
             should_run = True
         else:
@@ -633,18 +701,22 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 plan = orchestrator.plan(prompt)
                 if args.show_plan:
                     print(_plan_to_yaml_text(plan))
-                _save_outputs(outdir, plan, {}, "json", prompt)
+                plan_dir = _initialise_plan_storage(outdir, plan, prompt)
+                _persist_plan_result(plan_dir, plan, {}, "json", status="dry-run")
+                result_persisted = True
                 return 0
 
             built = orchestrator.plan_and_build(prompt)
             plan = built.plan
+
+            plan_dir = _initialise_plan_storage(outdir, plan, prompt)
 
             if args.execute:
                 should_run = True
             else:
                 should_run = _prompt_for_execution(plan)
 
-        assert plan is not None and built is not None and prompt is not None
+        assert plan is not None and built is not None and prompt is not None and plan_dir is not None
 
         if args.show_plan:
             print("\n=== Plan (YAML) ===\n")
@@ -659,10 +731,16 @@ async def main(argv: Optional[list[str]] = None) -> int:
             final_result = run_out.get("result")
             executed = True
             saved_result = final_result
+            assert plan_dir is not None
+            _persist_plan_result(plan_dir, plan, saved_result, args.format, status="executed")
+            result_persisted = True
         else:
             skip_message = "Execution skipped by user request."
             logging.info(skip_message)
             saved_result = {"status": "skipped", "message": skip_message}
+            assert plan_dir is not None
+            _persist_plan_result(plan_dir, plan, saved_result, args.format, status="skipped")
+            result_persisted = True
 
         if executed:
             print("\n=== Crew output ===\n")
@@ -694,16 +772,34 @@ async def main(argv: Optional[list[str]] = None) -> int:
             else:
                 print(saved_result["message"])
 
-        _save_outputs(outdir, plan, saved_result, args.format, prompt)
         return 0
 
     except PlanGenerationError as e:
         logging.error("%s", e)
         return 2
     except KeyboardInterrupt:
+        if plan_dir:
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            _update_plan_metadata(
+                plan_dir,
+                status="cancelled",
+                executed=False,
+                updated_at=now_iso,
+                completed_at=now_iso,
+            )
         logging.warning("Interrupted by user.")
         return 130
     except Exception as e:
+        if plan_dir and plan is not None and not result_persisted:
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            _update_plan_metadata(
+                plan_dir,
+                status="error",
+                executed=False,
+                error=str(e),
+                updated_at=now_iso,
+                completed_at=now_iso,
+            )
         logging.exception("Unhandled error: %s", e)
         return 1
 

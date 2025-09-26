@@ -69,6 +69,12 @@ based on a single natural language prompt.
 
    When a saved plan is executed the CLI rebuilds the crew directly from these
    YAML files, ensuring that the stored configuration is the one actually run.
+   Plans are now written to disk immediately after the planner responds so the
+   crew definition is preserved even if execution is skipped or fails later.
+   As soon as a run finishes (or is skipped) the corresponding directory is
+   updated with the execution status (`planned`, `executed`, `skipped`,
+   `dry-run`, `cancelled`, or `error`) and a `result.json`/`result.txt` file so
+   every piece of data is captured the moment it becomes available.
 
 ## Extending
 
