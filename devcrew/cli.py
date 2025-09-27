@@ -17,6 +17,13 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
 from .llm import SafeLLM
+from .orchestrator import (
+    AgentPlan,
+    BuiltCrew,
+    CrewPlan,
+    DynamicCrewOrchestrator,
+    PlanGenerationError,
+)
 from .plan_selection import ensure_prompt_for_plan, select_saved_plan
 from .plan_storage import (
     dump_plan_on_failure,
@@ -26,44 +33,7 @@ from .plan_storage import (
     prepare_output_dir,
     update_plan_metadata,
 )
-
-try:  # Optional streaming dependencies (not present in all crewAI installs)
-    from crewai.events.base_event_listener import BaseEventListener
-except Exception:  # pragma: no cover - defensive import shim
-    try:
-        from crewai.utilities.events.base_event_listener import BaseEventListener  # type: ignore
-    except Exception:  # pragma: no cover - best-effort fallback
-        BaseEventListener = object  # type: ignore[assignment]
-
-try:  # pragma: no cover - optional import path variations
-    from crewai.events.event_bus import crewai_event_bus as _get_bus
-except Exception:  # pragma: no cover - fallback when event bus is unavailable
-    _get_bus = None
-
-TokenStreamListener = None
-_token_listener_module = None
-for _candidate in (
-    "crewai.listeners.token_stream_listener",
-    "crewai.events.listeners.streaming.token_stream_listener",
-):
-    if TokenStreamListener is not None:
-        break
-    try:  # pragma: no cover - optional dependency discovery
-        _token_listener_module = __import__(_candidate, fromlist=["TokenStreamListener"])
-        TokenStreamListener = getattr(_token_listener_module, "TokenStreamListener", None)
-    except Exception:
-        TokenStreamListener = None
-
-del _candidate
-del _token_listener_module
-
-from .orchestrator import (
-    AgentPlan,
-    CrewPlan,
-    DynamicCrewOrchestrator,
-    PlanGenerationError,
-    BuiltCrew,
-)
+from .streaming import ConsoleStreamingPrinter
 from .tools import build_default_tool_registry
 
 
@@ -161,17 +131,13 @@ def build_orchestrator(args: argparse.Namespace) -> DynamicCrewOrchestrator:
 
     registry = build_default_tool_registry()
 
-    def planner_stream_handler(text: str) -> None:
-        sys.stdout.write(text)
-        sys.stdout.flush()
-
     return DynamicCrewOrchestrator(
         planner_llm=planner_llm,
         agent_llm_factory=agent_factory,
         tool_registry=registry,
         verbose=args.verbose,
         stream=args.stream,
-        planner_stream_handler=planner_stream_handler if args.stream else None,
+        planner_stream_handler=None,
     )
 
 
@@ -202,54 +168,15 @@ def _prompt_for_execution(plan: CrewPlan) -> bool:
 
 
 def _register_stream_listener(args: argparse.Namespace) -> None:
-    """Attach the optional crewAI token stream listener if available."""
+    """Ensure streaming tokens are printed with their source labels."""
 
     if not args.stream:
         return
 
-    listener_cls = TokenStreamListener
-    bus_getter = _get_bus if callable(_get_bus) else None
-
-    if listener_cls is None or bus_getter is None:
-        LOGGER.debug("Streaming requested but listener hooks are unavailable; skipping.")
-        return
-
-    if not isinstance(listener_cls, type):  # pragma: no cover - defensive guard
-        LOGGER.debug("TokenStreamListener is not instantiable; skipping stream listener.")
-        return
-
-    if BaseEventListener is not object and isinstance(BaseEventListener, type):
-        if not issubclass(listener_cls, BaseEventListener):
-            LOGGER.debug(
-                "TokenStreamListener does not inherit from BaseEventListener; skipping stream listener."
-            )
-            return
-
     try:
-        bus = bus_getter()
-    except Exception:  # pragma: no cover - optional dependency behaviour
-        LOGGER.debug("Failed to obtain crewAI event bus; skipping stream listener.", exc_info=True)
-        return
-
-    if bus is None:
-        LOGGER.debug("crewAI event bus helper returned None; skipping stream listener registration.")
-        return
-
-    try:
-        listener = listener_cls()
-    except Exception:  # pragma: no cover - optional dependency behaviour
-        LOGGER.debug("Could not instantiate TokenStreamListener; skipping registration.", exc_info=True)
-        return
-
-    add_listener = getattr(bus, "add_listener", None)
-    if callable(add_listener):
-        try:
-            add_listener(listener)
-        except Exception:  # pragma: no cover - optional dependency behaviour
-            LOGGER.debug(
-                "crewAI event bus rejected token stream listener; assuming auto-registration.",
-                exc_info=True,
-            )
+        ConsoleStreamingPrinter()
+    except Exception:  # pragma: no cover - defensive guard
+        LOGGER.exception("No se pudo inicializar el listener de streaming.")
 
 
 async def main(argv: Optional[list[str]] = None) -> int:

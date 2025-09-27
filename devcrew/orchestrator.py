@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError
 
 from .tools import ToolRegistry
+from .streaming import PrefixedStreamWriter
 
 
 
@@ -119,8 +120,11 @@ class DynamicCrewOrchestrator:
         self._planner_instructions = planner_instructions or self._default_planner_instructions()
         self._planner_stream_enabled = stream
         self._planner_stream_handler = planner_stream_handler
+        self._planner_stream_writer: Optional[PrefixedStreamWriter] = None
         if self._planner_stream_enabled and self._planner_stream_handler is None:
-            self._planner_stream_handler = self._default_stream_handler
+            writer = PrefixedStreamWriter("▶ Planificador:\n")
+            self._planner_stream_writer = writer
+            self._planner_stream_handler = writer.write
 
     @staticmethod
     def _default_planner_instructions() -> str:
