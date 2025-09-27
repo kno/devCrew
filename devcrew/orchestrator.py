@@ -116,13 +116,110 @@ class DynamicCrewOrchestrator:
 
     @staticmethod
     def _default_planner_instructions() -> str:
-        return (
-            "You are an expert project manager that assembles specialised AI "
-            "agents to solve complex problems. Based on the user's problem you "
-            "must describe the agents, tasks and tools required to solve it. "
-            "Always answer with a JSON object following the schema provided "
-            "in the system message."
-        )
+      return (
+        "You are a CrewAI configuration generator assistant. Your role is to help the user create a well-structured CrewAI YAML configuration (and any companion YAMLs if needed) through an interactive conversation.\n"
+        "\n"
+        "  ## CrewAI Overview\n"
+        "  CrewAI orchestrates multiple specialized agents to collaborate on complex tasks. Agents use role-specific prompts, restricted tool allowlists, and shared context to produce results. Crews can run in different processes (hierarchical, sequential, or parallel). Tools are drawn from `crewai-tools`, LangChain integrations, and safe shell/web utilities. Model selection is configurable via environment variables (.env).\n"
+        "\n"
+        "  Default model mapping (configurable):\n"
+        "  - Complex tasks (formerly \"opus\"): use `${LLM_COMPLEX:=Qwen3-0.6B-Q8_0}`\n"
+        "  - Simpler tasks (formerly \"sonnet\"): use `${LLM_SIMPLE:=Qwen3-0.6B-Q8_0}`\n"
+        "\n"
+        "  Key capabilities:\n"
+        "  - Define multiple agents with roles/specializations, custom prompts, and per-agent tool allowlists\n"
+        "  - Choose a crew-wide process (hierarchical/sequential/parallel) or let an orchestrator decide dynamically\n"
+        "  - Assign directory contexts per agent; support multi-directory access\n"
+        "  - Use safe Bash/WebSearch/WebFetch tools and file read/write with guardrails\n"
+        "  - Support custom system prompts per agent\n"
+        "  - Centralize logging to files for auditing\n"
+        "\n"
+        "  ## Your Task\n"
+        "  1. Start by asking about the user's project structure and development needs\n"
+        "  2. Understand what kind of team they need (roles, specializations)\n"
+        "  3. Suggest an appropriate CrewAI topology (hierarchical/sequential/parallel or dynamic)\n"
+        "  4. Help them refine and customize the configuration (agents, tasks, tools, directories)\n"
+        "  5. Generate the final `*-crew.yml` content (and any companion YAMLs if required)\n"
+        "  6. When the configuration is complete, save it to a descriptive filename based on the crew’s function\n"
+        "\n"
+        "  ## File Naming Convention\n"
+        "  Since no output file was specified, name the file based on the crew’s function. Examples:\n"
+        "    - web-dev-crew.yml for full-stack web development teams\n"
+        "    - data-pipeline-crew.yml for data processing teams\n"
+        "    - microservices-crew.yml for microservice architectures\n"
+        "    - mobile-app-crew.yml for mobile development teams\n"
+        "    - ml-research-crew.yml for machine learning teams\n"
+        "    - devops-crew.yml for infrastructure and deployment teams\n"
+        "  Use descriptive names that clearly indicate the crew’s purpose.\n"
+        "\n"
+        "  ## Configuration Structure (YAML)\n"
+        "  ```yaml\n"
+        "  version: 1\n"
+        "  crew:\n"
+        "    name: \"Descriptive Crew Name\"\n"
+        "    # process may be \"hierarchical\", \"sequential\", or \"parallel\"\n"
+        "    process: dynamic            # let the orchestrator choose at runtime\n"
+        "    orchestrator:\n"
+        "      strategy: auto            # auto-switch between hierarchical/sequential/parallel\n"
+        "      criteria:\n"
+        "        - complexity\n"
+        "        - dependency_graph\n"
+        "        - IO_boundness\n"
+        "      logging:\n"
+        "        enabled: true\n"
+        "        path: ./logs/crew.log\n"
+        "        level: INFO\n"
+        "\n"
+        "    # Optional: pre/post commands (run by your launcher scripts)\n"
+        "    before:\n"
+        "      - \"echo 'Setting up environment...'\"\n"
+        "    after:\n"
+        "      - \"echo 'Teardown complete'\"\n"
+        "\n"
+        "    # Global model defaults (overridable per agent). Values read from .env\n"
+        "    models:\n"
+        "      complex: \"${LLM_COMPLEX:=Qwen3-0.6B-Q8_0}\"\n"
+        "      simple:  \"${LLM_SIMPLE:=Qwen3-0.6B-Q8_0}\"\n"
+        "\n"
+        "    agents:\n"
+        "      agent_key:\n"
+        "        role: \"Clear role name\"\n"
+        "        goal: \"Goal this agent optimizes for\"\n"
+        "        backstory: \"Short context for behavior\"\n"
+        "        model: \"${LLM_COMPLEX:=Qwen3-0.6B-Q8_0}\"\n"
+        "        directories: [\"./path/primary\", \"./path/secondary\"]   # multi-directory support\n"
+        "        tools:\n"
+        "          allow:\n"
+        "            - FileRead\n"
+        "            - FileWrite\n"
+        "            - ShellSafe       # guarded shell (no destructive commands)\n"
+        "            - WebSearch       # searxng-backed\n"
+        "            - WebFetch        # HTTP fetch with safety limits\n"
+        "          deny:\n"
+        "            - ShellSafe(rm:*) # pattern-based deny examples\n"
+        "        prompt: |\n"
+        "          Custom system prompt for specialization.\n"
+        "\n"
+        "          For maximum efficiency, whenever you need to perform multiple independent operations, invoke all relevant tools simultaneously rather than sequentially.\n"
+        "\n"
+        "    tasks:\n"
+        "      - id: task_key\n"
+        "        description: \"What to do and constraints\"\n"
+        "        expected_output: \"Definition of done / schema\"\n"
+        "        agent: agent_key\n"
+        "        context:\n"
+        "          - \"Shared notes or file paths\"\n"
+        "        inputs:\n"
+        "          - name: \"param1\"\n"
+        "            required: true\n"
+        "\n"
+        "    outputs:\n"
+        "      artifacts_dir: ./artifacts\n"
+        "      persist_logs: true\n"
+        "  ```\n"
+      )
+
+
 
     def plan(self, prompt: str) -> CrewPlan:
         """Generate a :class:`CrewPlan` for ``prompt`` using the planner LLM."""
@@ -137,6 +234,7 @@ class DynamicCrewOrchestrator:
                 "  \"process\": str,  // sequential | hierarchical | parallel\n"
                 "  \"agents\": [\n"
                 "    {\n"
+                "      \"name\": str,\n"
                 "      \"role\": str,\n"
                 "      \"goal\": str,\n"
                 "      \"backstory\": str,\n"
@@ -148,6 +246,7 @@ class DynamicCrewOrchestrator:
                 "  ],\n"
                 "  \"tasks\": [\n"
                 "    {\n"
+                "      \"name\": str,\n"
                 "      \"description\": str,\n"
                 "      \"expected_output\": str,\n"
                 "      \"agent\": str,  // reference to an agent name\n"
@@ -159,7 +258,14 @@ class DynamicCrewOrchestrator:
                 "**Hard requirements**:\n"
                 "- Return AT LEAST ONE agent and AT LEAST ONE task.\n"
                 "- Every task.agent MUST reference an existing agent name.\n"
+                "- Every agent and task MUST include a \"name\" value.\n"
+                "- Names must be unique within their section.\n"
                 "- If no tool is applicable, set tools to [] (do NOT invent tools).\n"
+                "- The crew you design must build the solution. Describe the "
+                "  concrete deliverables each task should produce (e.g. code "
+                "  files, test plans) and the key steps to create them.\n"
+                "- Never attempt to solve the user's request yourself; focus on "
+                "  instructing the agents on how to produce the solution.\n"
                 "Only include tools that are present in the provided list. "
                 "If none of the available tools are useful, return an empty "
                 "list for \"tools\".\n\n"
@@ -252,6 +358,107 @@ class DynamicCrewOrchestrator:
 
         raise json.JSONDecodeError("No valid JSON object found", s, 0)
 
+    @staticmethod
+    def _coerce_name(value: str) -> str:
+        if not isinstance(value, str):
+            value = str(value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _ensure_unique_name(base: str, *, used: set[str]) -> str:
+        name = DynamicCrewOrchestrator._coerce_name(base) or "Unnamed"
+        candidate = name
+        suffix = 2
+        while candidate in used:
+            candidate = f"{name} ({suffix})"
+            suffix += 1
+        used.add(candidate)
+        return candidate
+
+    def _normalise_plan_payload(self, data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return data
+
+        normalised: dict[str, Any] = dict(data)
+
+        agents_raw = data.get("agents") or []
+        agents: List[dict[str, Any]] = []
+        used_agent_names: set[str] = set()
+        agent_names: List[str] = []
+        alias_map: dict[str, str] = {}
+
+        for idx, raw in enumerate(list(agents_raw)):
+            if isinstance(raw, dict):
+                agent_dict = dict(raw)
+            elif isinstance(raw, str):
+                agent_dict = {"role": raw}
+            else:
+                continue
+
+            candidates = [
+                self._coerce_name(agent_dict.get("name", "")),
+                self._coerce_name(agent_dict.get("role", "")),
+                f"Agent {idx + 1}",
+            ]
+            base_name = next((c for c in candidates if c), "Agent")
+            name = self._ensure_unique_name(base_name, used=used_agent_names)
+            agent_dict["name"] = name
+
+            if not agent_dict.get("role"):
+                agent_dict["role"] = name
+
+            for label in {agent_dict.get("name"), agent_dict.get("role"), candidates[0]}:
+                coerced = self._coerce_name(label) if label else ""
+                if coerced:
+                    alias_map.setdefault(coerced.lower(), name)
+
+            agents.append(agent_dict)
+            agent_names.append(name)
+
+        if agents:
+            normalised["agents"] = agents
+
+        tasks_raw = data.get("tasks") or []
+        tasks: List[dict[str, Any]] = []
+        used_task_names: set[str] = set()
+
+        for idx, raw in enumerate(list(tasks_raw)):
+            if isinstance(raw, dict):
+                task_dict = dict(raw)
+            elif isinstance(raw, str):
+                task_dict = {"description": raw}
+            else:
+                continue
+
+            candidates = [
+                self._coerce_name(task_dict.get("name", "")),
+                self._coerce_name(task_dict.get("description", "")),
+                f"Task {idx + 1}",
+            ]
+            base_name = next((c for c in candidates if c), "Task")
+            name = self._ensure_unique_name(base_name, used=used_task_names)
+            task_dict["name"] = name
+
+            agent_ref = self._coerce_name(task_dict.get("agent", ""))
+            if agent_ref:
+                mapped = alias_map.get(agent_ref.lower())
+                if not mapped:
+                    mapped = next(
+                        (a for a in agent_names if a.lower() == agent_ref.lower()),
+                        None,
+                    )
+                if mapped:
+                    task_dict["agent"] = mapped
+            if not task_dict.get("agent") and agent_names:
+                task_dict["agent"] = agent_names[0]
+
+            tasks.append(task_dict)
+
+        if tasks:
+            normalised["tasks"] = tasks
+
+        return normalised
+
     def _parse_plan(self, raw_plan: Any) -> CrewPlan:
         if isinstance(raw_plan, CrewPlan):
             return raw_plan
@@ -267,7 +474,8 @@ class DynamicCrewOrchestrator:
                 json_str = self._extract_first_json_object(text)
                 data = json.loads(json_str)
 
-        plan = CrewPlan.model_validate(data)
+        normalised = self._normalise_plan_payload(data)
+        plan = CrewPlan.model_validate(normalised)
         return plan
 
     # -----------------------
@@ -365,11 +573,22 @@ class DynamicCrewOrchestrator:
         )
         return BuiltCrew(plan=plan, crew=crew)
 
-    def run(self, prompt: str, *, kickoff_inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Plan, build and execute a crew to respond to ``prompt``."""
+    def plan_and_build(self, prompt: str) -> BuiltCrew:
+        """Convenience helper that plans and immediately builds a crew."""
 
         plan = self.plan(prompt)
-        built = self.build_crew(plan)
+        return self.build_crew(plan)
+
+    def kickoff(
+        self,
+        built: BuiltCrew,
+        prompt: str,
+        *,
+        kickoff_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Kick off an already planned and built crew."""
+
+        plan = built.plan
         inputs = {"problem": prompt}
         if kickoff_inputs:
             inputs.update(kickoff_inputs)
@@ -402,3 +621,9 @@ class DynamicCrewOrchestrator:
                 )
 
         return {"plan": plan, "result": result}
+
+    def run(self, prompt: str, *, kickoff_inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Plan, build and execute a crew to respond to ``prompt``."""
+
+        built = self.plan_and_build(prompt)
+        return self.kickoff(built, prompt, kickoff_inputs=kickoff_inputs)
