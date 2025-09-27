@@ -87,15 +87,26 @@ def _load_prompt(args: argparse.Namespace) -> str:
     return sys.stdin.read()
 
 
-def _create_chat_model(*, model: str, temperature: float, provider: Optional[str]) -> BaseChatModel:
+def _create_chat_model(
+    *,
+    model: str,
+    temperature: float,
+    provider: Optional[str],
+    stream: bool,
+) -> BaseChatModel:
     if provider:
         try:
-            return init_chat_model(model=model, model_provider=provider, temperature=temperature, streaming=True)
+            return init_chat_model(
+                model=model,
+                model_provider=provider,
+                temperature=temperature,
+                streaming=stream,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to initialise chat model '{model}' for provider '{provider}'."
             ) from exc
-    return ChatOpenAI(model=model, temperature=temperature)
+    return ChatOpenAI(model=model, temperature=temperature, streaming=stream)
 
 
 def _resolve_provider(cli_value: Optional[str], *env_vars: str) -> Optional[str]:
@@ -119,6 +130,7 @@ def build_orchestrator(args: argparse.Namespace) -> DynamicCrewOrchestrator:
         model=args.planner_model,
         temperature=args.planner_temperature,
         provider=planner_provider,
+        stream=args.stream,
     )
 
     # --- Agents ---
@@ -148,11 +160,18 @@ def build_orchestrator(args: argparse.Namespace) -> DynamicCrewOrchestrator:
         )
 
     registry = build_default_tool_registry()
+
+    def planner_stream_handler(text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
     return DynamicCrewOrchestrator(
         planner_llm=planner_llm,
         agent_llm_factory=agent_factory,
         tool_registry=registry,
         verbose=args.verbose,
+        stream=args.stream,
+        planner_stream_handler=planner_stream_handler if args.stream else None,
     )
 
 

@@ -1,7 +1,9 @@
 """Dynamic crew orchestrator built on top of crewAI."""
 from __future__ import annotations
 
-import json, time
+import json
+import sys
+import time
 import logging
 import os
 import re
@@ -107,12 +109,18 @@ class DynamicCrewOrchestrator:
         *,
         planner_instructions: Optional[str] = None,
         verbose: bool = False,
+        stream: bool = False,
+        planner_stream_handler: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.planner_llm = planner_llm
         self.agent_llm_factory = agent_llm_factory
         self.tool_registry = tool_registry
         self.verbose = verbose
         self._planner_instructions = planner_instructions or self._default_planner_instructions()
+        self._planner_stream_enabled = stream
+        self._planner_stream_handler = planner_stream_handler
+        if self._planner_stream_enabled and self._planner_stream_handler is None:
+            self._planner_stream_handler = self._default_stream_handler
 
     @staticmethod
     def _default_planner_instructions() -> str:
@@ -221,6 +229,50 @@ class DynamicCrewOrchestrator:
 
 
 
+    @staticmethod
+    def _default_stream_handler(text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def _emit_planner_stream(self, text: str) -> None:
+        if not text:
+            return
+        handler = self._planner_stream_handler
+        if not handler:
+            return
+        try:
+            handler(text)
+        except Exception:  # pragma: no cover - defensive guard around callbacks
+            logger.debug("Planner stream handler raised; disabling streaming output.", exc_info=True)
+            self._planner_stream_handler = None
+            self._planner_stream_enabled = False
+
+    @staticmethod
+    def _chunk_to_text(chunk: Any) -> str:
+        content = getattr(chunk, "content", chunk)
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text_val = item.get("text") or item.get("content")
+                    if text_val:
+                        parts.append(str(text_val))
+                    continue
+                text_attr = getattr(item, "text", None)
+                if text_attr:
+                    parts.append(str(text_attr))
+            return "".join(parts)
+        return str(content)
+
+
+
     def plan(self, prompt: str) -> CrewPlan:
         """Generate a :class:`CrewPlan` for ``prompt`` using the planner LLM."""
 
@@ -273,8 +325,37 @@ class DynamicCrewOrchestrator:
                 f"{self._planner_instructions}"
             )
         )
-        response = self.planner_llm.invoke([sys_msg, HumanMessage(content=prompt)])
-        raw_plan = getattr(response, "content", response)
+        messages = [sys_msg, HumanMessage(content=prompt)]
+
+        raw_plan: Any
+        if self._planner_stream_enabled and hasattr(self.planner_llm, "stream"):
+            try:
+                streamed_parts: list[str] = []
+                stream_method = getattr(self.planner_llm, "stream")
+                for chunk in stream_method(messages):  # type: ignore[attr-defined]
+                    text = self._chunk_to_text(chunk)
+                    if not text:
+                        continue
+                    streamed_parts.append(text)
+                    self._emit_planner_stream(text)
+
+                if streamed_parts:
+                    self._emit_planner_stream("\n")
+
+                raw_plan = "".join(streamed_parts)
+                if not raw_plan.strip():
+                    response = self.planner_llm.invoke(messages)
+                    raw_plan = getattr(response, "content", response)
+            except Exception:
+                logger.warning(
+                    "Planner streaming failed; retrying with standard invocation.",
+                    exc_info=True,
+                )
+                response = self.planner_llm.invoke(messages)
+                raw_plan = getattr(response, "content", response)
+        else:
+            response = self.planner_llm.invoke(messages)
+            raw_plan = getattr(response, "content", response)
         try:
             plan = self._parse_plan(raw_plan)
             logger.info(
