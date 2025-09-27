@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional
 
 from crewai.tools import BaseTool
+from crewai_tools import FileReadTool, FileWriterTool
+
 import os
 import requests
 
@@ -114,4 +116,4 @@ class SearxngSearchTool(BaseTool):
 def build_default_tool_registry() -> ToolRegistry:
     """Create a :class:`ToolRegistry` pre-populated with common tools."""
 
-    return ToolRegistry(tools=[CalculatorTool(), SearxngSearchTool()])
+    return ToolRegistry(tools=[SearxngSearchTool(), FileReadTool(), FileWriterTool()])
