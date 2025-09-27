@@ -61,6 +61,9 @@ from .orchestrator import (
 from .tools import build_default_tool_registry
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def _configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     root = logging.getLogger()
@@ -614,52 +617,58 @@ def _persist_plan_result(
             else:
                 fh.write(str(result))
 
-    now_iso = datetime.now().isoformat(timespec="seconds")
-    executed = status == "executed"
-    _update_plan_metadata(
-        plan_dir,
-        status=status,
-        executed=executed,
-        result_file=result_file.name,
-        result_format=fmt,
-        completed_at=now_iso,
-        updated_at=now_iso,
-    )
-    logging.info("Outputs saved in %s (result: %s)", plan_dir, result_file)
-    return result_file
+    logging.info("Outputs saved: %s , %s", plan_file, result_file)
 
 
-def _dump_plan_on_failure(plan: CrewPlan, plan_dir: Optional[Path]) -> None:
-    """Log the current plan to help diagnose failures."""
+def _register_stream_listener(args: argparse.Namespace) -> None:
+    """Attach the optional crewAI token stream listener if available."""
 
-    try:
-        plan_yaml = _plan_to_yaml_text(plan).strip()
-    except Exception as exc:  # pragma: no cover - defensive serialisation guard
-        logging.debug("Failed to serialise plan for failure dump: %s", exc)
+    if not args.stream:
         return
 
-    if not plan_yaml:
+    listener_cls = TokenStreamListener
+    bus_getter = _get_bus if callable(_get_bus) else None
+
+    if listener_cls is None or bus_getter is None:
+        LOGGER.debug("Streaming requested but listener hooks are unavailable; skipping.")
         return
 
-    logging.error("Plan snapshot at failure:\n%s", plan_yaml)
-    if plan_dir:
-        logging.error("Plan files available under: %s", plan_dir)
+    if not isinstance(listener_cls, type):  # pragma: no cover - defensive guard
+        LOGGER.debug("TokenStreamListener is not instantiable; skipping stream listener.")
+        return
 
+    if BaseEventListener is not object and isinstance(BaseEventListener, type):
+        if not issubclass(listener_cls, BaseEventListener):
+            LOGGER.debug(
+                "TokenStreamListener does not inherit from BaseEventListener; skipping stream listener."
+            )
+            return
 
-def _prompt_for_execution(plan: CrewPlan) -> bool:
-    """Ask the user whether the freshly built crew should be executed."""
-
-    prompt = (
-        f"Crew planned with {len(plan.agents)} agents and {len(plan.tasks)} tasks. "
-        "Run it now? [y/N]: "
-    )
     try:
-        response = input(prompt)
-    except EOFError:
-        logging.info("No input available to confirm execution; skipping run.")
-        return False
+        bus = bus_getter()
+    except Exception:  # pragma: no cover - optional dependency behaviour
+        LOGGER.debug("Failed to obtain crewAI event bus; skipping stream listener.", exc_info=True)
+        return
 
-    return response.strip().lower() in {"y", "yes"}
+    if bus is None:
+        LOGGER.debug("crewAI event bus helper returned None; skipping stream listener registration.")
+        return
+
+    try:
+        listener = listener_cls()
+    except Exception:  # pragma: no cover - optional dependency behaviour
+        LOGGER.debug("Could not instantiate TokenStreamListener; skipping registration.", exc_info=True)
+        return
+
+    add_listener = getattr(bus, "add_listener", None)
+    if callable(add_listener):
+        try:
+            add_listener(listener)
+        except Exception:  # pragma: no cover - optional dependency behaviour
+            LOGGER.debug(
+                "crewAI event bus rejected token stream listener; assuming auto-registration.",
+                exc_info=True,
+            )
 
 
 async def main(argv: Optional[list[str]] = None) -> int:
